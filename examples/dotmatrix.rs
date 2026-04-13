@@ -33,6 +33,7 @@ impl Bitmap {
         self.data.as_slice()
     }
 }
+
 #[derive(Default, Deserialize)]
 #[repr(u32)]
 enum In {
