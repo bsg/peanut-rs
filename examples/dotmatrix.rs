@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use peanut_rs::Server;
+use peanut::Server;
 use wire::{Deserialize, Serialize};
 
 const BITMAP_LEN: usize = 1000 * 1000;
