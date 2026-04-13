@@ -107,8 +107,8 @@ impl Client {
     }
 }
 
-trait ConnectHandler<In, Out> = FnMut(&Server<In, Out>, &mut Client) -> std::io::Result<()>;
-trait MessageHandler<In, Out> = FnMut(&Server<In, Out>, &mut Client, In) -> std::io::Result<()>;
+pub trait ConnectHandler<In, Out> = FnMut(&Server<In, Out>, &mut Client) -> std::io::Result<()>;
+pub trait MessageHandler<In, Out> = FnMut(&Server<In, Out>, &mut Client, In) -> std::io::Result<()>;
 
 #[derive(Default)]
 struct Handlers<'srv, In, Out> {
