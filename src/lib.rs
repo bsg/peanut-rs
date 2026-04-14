@@ -59,6 +59,7 @@ enum ClientState {
 }
 
 pub struct Client {
+    id: usize,
     state: ClientState,
     expect: Expect,
     stream: TcpStream,
@@ -69,6 +70,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub fn send<T: Serialize>(&mut self, payload: &T) -> std::result::Result<(), std::io::Error> {
         let size = payload.wire_size();
 
@@ -305,6 +310,7 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                                         )
                                         .unwrap();
                                     self.clients_mut()[client_idx] = Some(Client {
+                                        id: client_idx,
                                         state: ClientState::PreHandshake,
                                         expect: Expect::Frame,
                                         stream,
