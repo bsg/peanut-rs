@@ -264,9 +264,13 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                 && !Instant::now().duration_since(*next_tick).is_zero()
             {
                 let tick_begin = Instant::now();
-                self.handlers_mut().tick.as_mut().unwrap()(self).unwrap(); // TODO
+                (unsafe { self.handlers_mut().tick.as_mut().unwrap_unchecked() })(self).unwrap(); // TODO
                 let tick_elapsed = Instant::now() - tick_begin;
-                let t = self.tick_interval().unwrap().saturating_sub(tick_elapsed);
+                let t = unsafe {
+                    self.tick_interval()
+                        .unwrap_unchecked()
+                        .saturating_sub(tick_elapsed)
+                };
                 self.next_tick_mut().replace(Instant::now() + t);
                 timeout = Some(t);
             }
@@ -498,6 +502,7 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                     }
 
                     let opcode = (buffer[0]) & 0b1111;
+                    // TODO impl WsOpcode
                     match opcode {
                         2 => (),
                         8 => {
