@@ -52,7 +52,6 @@ enum Expect {
     Payload,
 }
 
-// FIXME what are these names lmao
 enum ClientState {
     PreHandshake,
     PostHandshake,
