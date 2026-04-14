@@ -74,7 +74,7 @@ fn main() {
 
                 bitmap.borrow_mut().set_bit(idx as usize, status == 1);
 
-                for client in server.clients_mut().iter_mut().flatten() {
+                for client in server.clients_iter_mut() {
                     client.send(&Out::Update(payload))?;
                 }
             }

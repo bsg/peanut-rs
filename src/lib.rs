@@ -7,6 +7,8 @@ use std::{
     io::{Error, ErrorKind, Read, Write},
     marker::PhantomData,
     net::SocketAddr,
+    ptr::NonNull,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
@@ -50,9 +52,10 @@ enum Expect {
     Payload,
 }
 
+// FIXME what are these names lmao
 enum ClientState {
-    ServeContent,
-    Stream,
+    PreHandshake,
+    PostHandshake,
 }
 
 pub struct Client {
@@ -109,11 +112,13 @@ impl Client {
 
 pub trait ConnectHandler<In, Out> = FnMut(&Server<In, Out>, &mut Client) -> std::io::Result<()>;
 pub trait MessageHandler<In, Out> = FnMut(&Server<In, Out>, &mut Client, In) -> std::io::Result<()>;
+pub trait TickHandler<In, Out> = FnMut(&Server<In, Out>) -> std::io::Result<()>;
 
 #[derive(Default)]
 struct Handlers<'srv, In, Out> {
     pub connect: Option<Box<dyn ConnectHandler<In, Out> + 'srv>>,
     pub message: Option<Box<dyn MessageHandler<In, Out> + 'srv>>,
+    pub tick: Option<Box<dyn TickHandler<In, Out> + 'srv>>,
 }
 
 enum ContentType {
@@ -132,6 +137,8 @@ pub struct Server<'srv, In, Out> {
     sha1: UnsafeCell<Sha1>,
     handlers: UnsafeCell<Handlers<'srv, In, Out>>,
     resources: HashMap<String, Resource>,
+    tick_interval: UnsafeCell<Option<Duration>>,
+    next_tick: UnsafeCell<Option<Instant>>,
     marker: PhantomData<(In, Out)>,
 }
 
@@ -143,6 +150,8 @@ impl<'srv, In: Default, Out: Default> Default for Server<'srv, In, Out> {
             sha1: UnsafeCell::new(Sha1::new()),
             handlers: Default::default(),
             resources: HashMap::new(),
+            tick_interval: None.into(),
+            next_tick: None.into(),
             marker: PhantomData,
         }
     }
@@ -159,13 +168,36 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
         unsafe { &mut *self.sha1.get() }
     }
 
-    pub fn clients(&self) -> &[Option<Client>; MAX_CLIENTS] {
-        unsafe { &*self.clients.get() }
+    fn tick_interval(&self) -> &Option<Duration> {
+        unsafe { &*self.tick_interval.get() }
     }
 
     #[allow(clippy::mut_from_ref)]
-    pub fn clients_mut(&self) -> &mut [Option<Client>; MAX_CLIENTS] {
+    fn tick_interval_mut(&self) -> &mut Option<Duration> {
+        unsafe { &mut *self.tick_interval.get() }
+    }
+
+    fn next_tick(&self) -> &Option<Instant> {
+        unsafe { &*self.next_tick.get() }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn next_tick_mut(&self) -> &mut Option<Instant> {
+        unsafe { &mut *self.next_tick.get() }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn clients_mut(&self) -> &mut [Option<Client>; MAX_CLIENTS] {
         unsafe { &mut *self.clients.get() }
+    }
+
+    pub fn clients_iter_mut(&self) -> ClientIterMut<'srv> {
+        let clients = self.clients_mut();
+        ClientIterMut {
+            ptr: unsafe { NonNull::from_ref(clients.first_mut().unwrap()).sub(1) },
+            end: unsafe { NonNull::from_ref(clients.last_mut().unwrap()).add(1) },
+            _marker: PhantomData,
+        }
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -179,6 +211,11 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
 
     pub fn on_message(&mut self, f: impl MessageHandler<In, Out> + 'srv) {
         self.handlers_mut().message = Some(Box::new(f));
+    }
+
+    pub fn on_tick(&mut self, interval: Duration, f: impl TickHandler<In, Out> + 'srv) {
+        self.tick_interval_mut().replace(interval);
+        self.handlers_mut().tick = Some(Box::new(f));
     }
 
     pub fn resource(&mut self, url: &str, path: &str) {
@@ -209,11 +246,43 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
             .register(&mut listener, LISTENER, Interest::READABLE)
             .unwrap();
 
-        let mut events = Events::with_capacity(1024);
-        loop {
-            self.poll_mut().poll(&mut events, None).unwrap();
+        if let Some(tick_interval) = self.tick_interval() {
+            self.next_tick_mut()
+                .replace(Instant::now() + *tick_interval);
+        }
 
-            for event in &events {
+        let mut events = Events::with_capacity(1024);
+        let mut skip = None;
+        'main_loop: loop {
+            let mut timeout = *self.tick_interval();
+
+            if let Some(next_tick) = self.next_tick()
+                && !Instant::now().duration_since(*next_tick).is_zero()
+            {
+                let tick_begin = Instant::now();
+                self.handlers_mut().tick.as_mut().unwrap()(self).unwrap(); // TODO
+                let tick_elapsed = Instant::now() - tick_begin;
+                let t = self.tick_interval().unwrap().saturating_sub(tick_elapsed);
+                self.next_tick_mut().replace(Instant::now() + t);
+                timeout = Some(t);
+            }
+
+            let iter = if let Some(skip) = skip {
+                events.iter().skip(skip)
+            } else {
+                self.poll_mut().poll(&mut events, timeout).unwrap();
+                #[allow(clippy::iter_skip_zero)]
+                events.iter().skip(0)
+            };
+
+            for (i, event) in iter.enumerate() {
+                if let Some(next_tick) = self.next_tick()
+                    && !Instant::now().duration_since(*next_tick).is_zero()
+                {
+                    skip = Some(i);
+                    continue 'main_loop;
+                }
+
                 match event.token() {
                     LISTENER => loop {
                         match listener.accept() {
@@ -236,7 +305,7 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                                         )
                                         .unwrap();
                                     self.clients_mut()[client_idx] = Some(Client {
-                                        state: ClientState::ServeContent,
+                                        state: ClientState::PreHandshake,
                                         expect: Expect::Frame,
                                         stream,
                                         rx: Default::default(),
@@ -275,7 +344,7 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                                     Err(ref e) => match e.kind() {
                                         std::io::ErrorKind::WouldBlock => {
                                             match client.state {
-                                                ClientState::ServeContent => {
+                                                ClientState::PreHandshake => {
                                                     match self
                                                         .serve_content(client, self.sha1_mut())
                                                     {
@@ -289,7 +358,7 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                                                         }
                                                     }
                                                 }
-                                                ClientState::Stream => {
+                                                ClientState::PostHandshake => {
                                                     match self.handle_data(client) {
                                                         Ok(_) => (),
                                                         Err(_) => {
@@ -318,7 +387,8 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                             }
                         }
 
-                        if event.is_writable() && matches!(client.state, ClientState::Stream) {
+                        if event.is_writable() && matches!(client.state, ClientState::PostHandshake)
+                        {
                             match client.tx.sink_into(&mut client.stream) {
                                 Ok(_) => (),
                                 Err(ref e) => match e.kind() {
@@ -336,6 +406,8 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                     }
                 }
             }
+
+            skip = None;
         }
     }
 
@@ -354,7 +426,7 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
                     f(self, client)?;
                 }
 
-                client.state = ClientState::Stream;
+                client.state = ClientState::PostHandshake;
                 return Ok(());
             }
         }
@@ -458,16 +530,19 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
 
                     let (lower, upper) = client.rx.as_mut_slices().unwrap();
                     // TODO simd
-                    let mut key_idx = 0usize;
-                    lower.iter_mut().for_each(|x| {
-                        *x ^= client.masking_key[key_idx];
-                        key_idx = (key_idx + 1) % 4;
-                    });
-                    if let Some(upper) = upper {
-                        upper.iter_mut().for_each(|x| {
-                            *x ^= client.masking_key[key_idx];
-                            key_idx = (key_idx + 1) % 4;
+                    lower
+                        .iter_mut()
+                        .zip(client.masking_key.iter().cycle())
+                        .for_each(|(x, k)| {
+                            *x ^= k;
                         });
+                    if let Some(upper) = upper {
+                        upper
+                            .iter_mut()
+                            .zip(client.masking_key.iter().cycle())
+                            .for_each(|(x, k)| {
+                                *x ^= k;
+                            });
                     }
 
                     if let Some(f) = &mut self.handlers_mut().message {
@@ -485,5 +560,35 @@ impl<'srv, In: Deserialize, Out: Serialize> Server<'srv, In, Out> {
         }
 
         Ok(())
+    }
+}
+
+pub struct ClientIterMut<'srv> {
+    ptr: NonNull<Option<Client>>,
+    end: NonNull<Option<Client>>,
+    _marker: PhantomData<&'srv mut Client>,
+}
+
+impl<'srv> Iterator for ClientIterMut<'srv> {
+    type Item = &'srv mut Client;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            self.ptr = unsafe { self.ptr.add(1) };
+            if self.ptr == self.end {
+                return None;
+            }
+
+            if let Some(c) = unsafe { self.ptr.as_mut() } {
+                match c.state {
+                    ClientState::PreHandshake => {
+                        continue;
+                    }
+                    ClientState::PostHandshake => {
+                        return Some(c);
+                    }
+                }
+            }
+        }
     }
 }
